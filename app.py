@@ -171,6 +171,34 @@ ATR_RANGE = {"stock": (2, 8), "forex": (0.25, 2.5), "commodity": (0.8, 5),
              "index": (0.6, 6), "crypto": (2, 10)}
 
 
+def reaction(d15c, prox, dist, long, look=4):
+    """Did price reach the zone in the last `look` completed bars, and did it reject?
+    Returns (state, time): 'rejected', 'touched' (no rejection yet) or 'waiting' (not there yet).
+    Rejection = the bar tagged the zone and closed back out of it with a long wick
+    or an engulfing candle in the trade direction."""
+    t = d15c.tail(look + 1)
+    if len(t) < 2:
+        return "waiting", None
+    o, h, l, c = (t[k].values for k in ("Open", "High", "Low", "Close"))
+    for i in range(len(t) - 1, 0, -1):
+        hit = (l[i] <= prox) if long else (h[i] >= prox)
+        if not hit:
+            continue
+        rng = h[i] - l[i]
+        if rng <= 0:
+            return "touched", t.index[i]
+        if long:
+            out = c[i] > prox
+            wick = (min(o[i], c[i]) - l[i]) >= 0.5 * rng
+            engulf = c[i] > o[i] and c[i] >= o[i - 1] and o[i] <= c[i - 1] and c[i - 1] < o[i - 1]
+        else:
+            out = c[i] < prox
+            wick = (h[i] - max(o[i], c[i])) >= 0.5 * rng
+            engulf = c[i] < o[i] and c[i] <= o[i - 1] and o[i] >= c[i - 1] and c[i - 1] > o[i - 1]
+        return ("rejected" if out and (wick or engulf) else "touched"), t.index[i]
+    return "waiting", None
+
+
 def decimals(price):
     return 2 if price >= 100 else 3 if price >= 10 else 5 if price >= 1 else 6
 
@@ -237,6 +265,12 @@ def build_plays(tk, d15, d1h, dd, spread=None, max_dist=8.0, buf_pct=10.0, kind=
             continue
         rr = abs(tgt - entry) / risk
 
+        # zone quality extras: age, and whether the entry sits inside a bigger opposing zone
+        age_bars = len(d15) - 1 - z["idx"]
+        nested = any(x["height"] > z["height"] and min(x["prox"], x["dist"]) <= entry <= max(x["prox"], x["dist"])
+                     for x in opp)
+        react, react_ts = reaction(d15c, entry, z["dist"], long, look=4)
+
         # volume at the zone: the bar that touched it, otherwise the last two bars as price approaches
         rv, basis = None, None
         if bars:
@@ -269,7 +303,8 @@ def build_plays(tk, d15, d1h, dd, spread=None, max_dist=8.0, buf_pct=10.0, kind=
             screen=[bool(x) for x in screen], take=bool(take), tf="15m",
             atr15=a, vwap=None if vwap is None else round(vwap, nd),
             rv=None if rv is None else round(rv, 2), rv_basis=basis,
-            htf=htf,
+            htf=htf, depart=round(z["depart"], 1), age_bars=int(age_bars), nested=bool(nested),
+            react=react, react_ts=react_ts,
         ))
     plays.sort(key=lambda p: (p["take"], p["score"], p["rr"]), reverse=True)
     return plays
@@ -498,7 +533,9 @@ INDEX_CCY = {"^GDAXI": "EUR", "^FTSE": "GBP", "^N225": "JPY", "^AXJO": "AUD", "^
 # ---------------- saved settings (kept in the page address) ----------------
 FILTERS = {"f_events": True, "ev_min": 15.0, "manual_ev": "", "f_news": True, "news_hrs": 3.0,
            "f_earn": True, "f_rvol": True, "rv_weak": 0.8, "f_vwap": True, "vwap_tol": 1.0, "f_htf": True,
-           "f_index": True, "max_spread": 0.05}
+           "f_index": True, "max_spread": 0.05,
+           "f_depart": True, "zq_depart": 4.0, "f_age": True, "zq_age": 48.0, "f_nest": True,
+           "f_react": True}
 DEFAULTS = {"acct": "AUD", "equity": 10000.0, "risk_pct": 2.0, "sel": ["Forex", "Commodities", "Indices"],
             "watch": DEFAULT_WATCH, "extras": "", "show_close": False, "auto": False}
 DEFAULTS.update(FILTERS)
@@ -694,6 +731,17 @@ def filter_reasons(p, S, ctx, now=None):
             out.append(f"supply zone is {gap:.1f} ATR above session VWAP")
     if S["f_htf"] and p.get("htf") == ("down" if long else "up"):
         out.append("counter-trend: 1h makes " + ("lower highs and lower lows" if long else "higher highs and higher lows"))
+    if S["f_depart"] and p.get("depart") is not None and p["depart"] < S["zq_depart"]:
+        out.append(f"weak departure: the zone only moved {p['depart']:.1f} ATR away (needs {S['zq_depart']:.1f})")
+    if S["f_age"] and p.get("age_bars") is not None and p["age_bars"] > S["zq_age"] * 4:
+        out.append(f"old zone: formed about {p['age_bars'] / 4:.0f}h of trading ago (limit {S['zq_age']:.0f}h)")
+    if S["f_nest"] and p.get("nested"):
+        out.append("the zone sits inside a bigger " + ("supply" if long else "demand") + " zone")
+    if S["f_react"] and p.get("react") is not None:
+        if p["react"] == "waiting":
+            out.append("price has not reached the zone yet, wait for a rejection candle")
+        elif p["react"] == "touched":
+            out.append("price tagged the zone but has not printed a rejection candle")
     return out
 
 
@@ -705,6 +753,13 @@ def context_lines(p, S):
     if p.get("rv") is not None:
         out.append(f"Volume {'at the touch' if p.get('rv_basis') == 'touch' else 'approaching the zone'}: "
                    f"{p['rv']:.1f}x normal for this time of day")
+    if p.get("depart") is not None:
+        extra = " · inside a bigger opposing zone" if p.get("nested") else ""
+        out.append(f"Zone left by {p['depart']:.1f} ATR, formed about {p.get('age_bars', 0) / 4:.0f}h of trading ago{extra}")
+    if p.get("react"):
+        out.append({"rejected": "Rejection candle printed at the zone",
+                    "touched": "Price tagged the zone, no rejection candle yet",
+                    "waiting": "Price has not reached the zone yet"}[p["react"]])
     if p.get("htf"):
         out.append("1h structure: " + {"up": "higher highs and higher lows", "down": "lower highs and lower lows",
                                        "range": "sideways"}[p["htf"]])
@@ -943,6 +998,14 @@ with st.expander("Filters"):
                     step=0.25, key="vwap_tol")
     st.toggle("Block counter-trend plays (1h structure)", key="f_htf")
     st.toggle("Hold plays while SPY or QQQ is selling off or spiking", key="f_index")
+    st.toggle("Zone must have left strongly", key="f_depart")
+    st.number_input("Minimum departure (ATR)", min_value=2.0, max_value=10.0, step=0.5, key="zq_depart")
+    st.toggle("Block old zones", key="f_age")
+    st.number_input("Oldest zone allowed (hours of trading)", min_value=4.0, max_value=120.0, step=4.0, key="zq_age")
+    st.toggle("Block zones inside a bigger opposing zone", key="f_nest")
+    st.toggle("Only take after a rejection candle at the zone", key="f_react",
+              help="Price must have tagged the zone and closed back out with a long wick or engulfing candle. "
+                   "With this on, plays waiting for price to arrive show under Blocked until it happens.")
 
 S = {k: st.session_state[k] for k in FILTERS}
 acct = st.session_state["acct"]
